@@ -1,0 +1,133 @@
+currentDay = dt.datetime.today()
+currentDay = dt.date.today()
+currentMonth = dt.date(currentDay.year, currentDay.month, 1)
+
+previousDay = currentDay - dt.timedelta(days=1)
+lastday_previousMonth = currentMonth - dt.timedelta(days=1)
+previousMonth = dt.date(lastday_previousMonth.year
+                        , lastday_previousMonth.month
+                        , 1)
+
+print(currentDay,currentMonth,previousDay,previousMonth,lastday_previousMonth)
+
+
+all_data = spark.sql(f'''
+
+with union as (
+
+select region, role, city_am, merchant_id, 'A' as department, brand_name as business_name, merchant_name, city_mex_location
+     , ame_name, email_am, aml_name, email_aml, city_lead, email_city_lead, rsm
+     , case when lower(ame_name) like '%vacant%' then
+                                                 case when lower(aml_name) like 'no aml%' then 
+                                                                                               case when lower(city_lead) like 'no city lead%' then rsm else city_lead end
+                                                 else aml_name end
+            else ame_name end as final_am
+     , case when lower(ame_name) like '%vacant%' then
+                                                 case when lower(aml_name) like 'no aml%' then 
+                                                                                               case when lower(city_lead) like 'no city lead%' then rsm else email_city_lead end
+                                                 else email_aml end
+            else email_am end as final_am_email
+from user_mm_mart_spark
+
+union
+
+select region, role, city_am, merchant_id, 'B' as department, brand_name as business_name, merchant_name, city_mex_location
+     , ame_name, email_am, aml_name, email_aml, city_lead, email_city_lead, rsm
+     , case when lower(ame_name) like '%vacant%' then
+                                                 case when lower(aml_name) like 'no aml%' then 
+                                                                                               case when lower(city_lead) like 'no city lead%' then rsm else city_lead end
+                                                 else aml_name end
+            else ame_name end as final_am
+     , case when lower(ame_name) like '%vacant%' then
+                                                 case when lower(aml_name) like 'no aml%' then 
+                                                                                               case when lower(city_lead) like 'no city lead%' then rsm else email_city_lead end
+                                                 else email_aml end
+            else email_am end as final_am_email
+from user_mm_food_spark
+),
+
+--====================== MAKING MERCHANT OWNER ====================== 
+count as (
+SELECT distinct business_name
+              , count (distinct final_am) as count_ame
+FROM union as a
+GROUP BY business_name),
+              
+ame_temp as (              
+select count.business_name
+     , count.count_ame
+     , case when count.count_ame = 1 then any_value(union.final_am_email)
+                     else 'cek' end as ame_temp_email
+FROM count
+left join union on union.business_name = count.business_name
+GROUP BY count.business_name, count.count_ame),
+
+owner_temp as (
+select distinct union.business_name
+              , union.final_am_email
+              , count.count_ame
+              , count (distinct merchant_id)
+              , ROW_NUMBER() OVER (PARTITION BY union.business_name ORDER BY count (distinct merchant_id) DESC) as rn
+from union
+left join count on union.business_name = count.business_name
+where count.count_ame > 1
+group by 1,2,3
+order by 1
+),
+
+owner as (
+select * from owner_temp where rn = 1
+),
+
+owner_done as (
+select distinct c.business_name
+     , coalesce(o.final_am_email, a.ame_temp_email, 0) as mex_owner
+from count as c
+left join owner as o on o.business_name = c.business_name
+left join ame_temp as a on a.business_name = c.business_name
+)
+
+--====================== FINAL DATA ====================== 
+select distinct union.region, union.role, union.city_am, union.merchant_id, union.department, union.business_name, union.merchant_name, union.city_mex_location
+     , union.final_am, union.final_am_email
+     , o.mex_owner as merchant_owner
+from union 
+left join owner_done as o on union.business_name = o.business_name
+order by department, region, city_am, final_am
+''')
+
+all_data.createOrReplaceTempView('all_data_spark')
+all_data = all_data.toPandas()
+
+new_data = spark.sql(f'''
+
+select region, role, city_am, merchant_id, department, business_name, merchant_name, city_mex_location
+     , final_am, final_am_email, merchant_owner
+from all_data_spark
+where merchant_id not in (select merchant_id from last_month_alloc_spark)
+''').toPandas()
+
+remove_data = spark.sql(f'''
+
+select area_am_tm as region, role_am_tm as role, city_am_tm as city_am, merchant_id, department, business_name, merchant_name, city_name as city_mex_location
+     , am_tm as final_am, am_email_tm as final_am_email, merchant_owner_tm as merchant_owner
+from last_month_alloc_spark 
+where last_month_alloc_spark.merchant_id not in (select merchant_id from all_data_spark)
+''').toPandas()
+
+remove_data = spark.sql(f'''
+
+select area_am_tm as region, role_am_tm as role, city_am_tm as city_am, merchant_id, department, business_name, merchant_name, city_name as city_mex_location
+     , am_tm as final_am, am_email_tm as final_am_email, merchant_owner_tm as merchant_owner
+from last_month_alloc_spark 
+where last_month_alloc_spark.merchant_id not in (select merchant_id from all_data_spark)
+''').toPandas()
+
+update_data = spark.sql(f'''
+
+select a.merchant_id, a.final_am as correct_am, last_month_alloc_spark.am_tm, a.merchant_owner as correct_merchant_owner, last_month_alloc_spark.merchant_owner_tm
+from all_data_spark as a
+left join last_month_alloc_spark on last_month_alloc_spark.merchant_id = a.merchant_id
+where a.final_am <> last_month_alloc_spark.am_tm
+or a.merchant_owner <> last_month_alloc_spark.merchant_owner_tm
+''').toPandas()
